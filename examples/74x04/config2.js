@@ -5,7 +5,7 @@ module.exports = {
   clock: { mhz: 48, use_pll: true }, // optional; default 48 MHz PLL
   // doNotCheckForChanges: true,
   ports: {
-    a: {type: 'input',  width: 6, pins: ['d0', 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7']},
-    y: {type: 'output', width: 6, pins: ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7']},
+    a: {type: 'input',  width: 6, pins: ['d4', 'd6', 'a1', 'd0', 'c2', 'c4', 'c6', 'd3']},
+    y: {type: 'output', width: 6, pins: ['d5', 'd7', 'a2', 'c0', 'c1', 'd2', 'c5', 'c3']},
   }
 };

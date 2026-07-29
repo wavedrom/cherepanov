@@ -1,6 +1,6 @@
 module top(
-    input        [5:0] a,
-    output logic [5:0] y
+    input        [7:0] a,
+    output logic [7:0] y
 );
 
 always_comb y = ~a;

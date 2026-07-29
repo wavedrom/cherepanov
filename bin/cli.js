@@ -123,10 +123,58 @@ const pinMacro = (name) => name.toUpperCase();
 // ch32fun GPIO port pointer macro: GPIOA, GPIOB, GPIOC, GPIOD.
 const gpioPtr = (gpioPort) => `GPIO${gpioPort}`;
 
-const generateMainC = (ports, evalBody, topModule, portConfig) => {
+const getInPortsUsed = (inputs) => {
+    // Group input pins by GPIO port; read INDR once per port, then extract
+    // each pin's bit into its verilog port variable at the right position.
+    const inPinsByPort = {};
+    inputs.forEach(p => p.pins.forEach((pin, i) => {
+        (inPinsByPort[pin.gpioPort] = inPinsByPort[pin.gpioPort] || []).push({ port: p, bitIndex: i, pin });
+    }));
+    return Object.keys(inPinsByPort).sort();
+};
+
+const declarePreviousInputs = (inputs, cfg) => cfg.doNotCheckForChanges
+    ? '// change detection disabled'
+    : getInPortsUsed(inputs)
+        .map(p => 'static uint32_t p' + p.toLowerCase() + '_prev;')
+        .join('\n');
+
+const readInputs = (inputs, cfg) => {
+    // --- read inputs: load each touched GPIO port's INDR once, scatter bits ---
+    const inPortsUsed = getInPortsUsed(inputs);
+
+    const readLines = [];
+    if (!cfg.doNotCheckForChanges) {
+        readLines.push('        uint32_t changed = 0;');
+    }
+
+    // one local per touched GPIO port holding its INDR value
+    inPortsUsed.forEach(gp => {
+        const name = gp.toLowerCase();
+        readLines.push(`        uint32_t indr_${name} = ${gpioPtr(gp)}->INDR;`);
+        if (!cfg.doNotCheckForChanges) {
+            readLines.push(`\
+        if (__builtin_expect(indr_${name} != p${name}_prev, 0)) {
+            p${name}_prev = indr_${name};
+            changed = 1;
+        }`);
+        }
+    });
+    if (!cfg.doNotCheckForChanges) {
+        readLines.push('        if (__builtin_expect(changed == 0, 1)) continue;');
+    }
+    for (const p of inputs) {
+        const terms = p.pins.map((pin, i) =>
+            `            | (uint8_t)(((indr_${pin.gpioPort.toLowerCase()} >> ${pin.bit}U) & 1U) << ${i}U)`);
+        readLines.push(`        ${portVar(p.name)} = 0\n${terms.join('\n')}\n            ;`);
+    }
+    return readLines.join('\n');
+};
+
+const generateMainC = (ports, evalBody, topModule, userCfg) => {
     const A = cfg.api;
     // Attach resolved pins to each port and validate against the package.
-    const portsWithPins = ports.map(p => ({ ...p, pins: resolvePins(p, portConfig) }));
+    const portsWithPins = ports.map(p => ({ ...p, pins: resolvePins(p, userCfg.ports) }));
     const inputs  = portsWithPins.filter(p => p.direction === 'INPUT');
     const outputs = portsWithPins.filter(p => p.direction === 'OUTPUT');
     const portDecls = portsWithPins.map(p => `static ${p.ctype} ${portVar(p.name)};`).join('\n');
@@ -160,26 +208,6 @@ const generateMainC = (ports, evalBody, topModule, portConfig) => {
     }
     const initPins = initLines.join('\n');
 
-    // --- read inputs: load each touched GPIO port's INDR once, scatter bits ---
-    // Group input pins by GPIO port; read INDR once per port, then extract
-    // each pin's bit into its verilog port variable at the right position.
-    const inPinsByPort = {};
-    inputs.forEach(p => p.pins.forEach((pin, i) => {
-        (inPinsByPort[pin.gpioPort] = inPinsByPort[pin.gpioPort] || []).push({ port: p, bitIndex: i, pin });
-    }));
-    const readLines = [];
-    const inPortsUsed = Object.keys(inPinsByPort).sort();
-    // one local per touched GPIO port holding its INDR value
-    inPortsUsed.forEach(gp => {
-        readLines.push(`    uint32_t indr_${gp.toLowerCase()} = ${gpioPtr(gp)}->INDR;`);
-    });
-    for (const p of inputs) {
-        const terms = p.pins.map((pin, i) =>
-            `        | (uint8_t)(((indr_${pin.gpioPort.toLowerCase()} >> ${pin.bit}U) & 1U) << ${i}U)`);
-        readLines.push(`    ${portVar(p.name)} = 0\n${terms.join('\n')}\n        ;`);
-    }
-    const readInputs = readLines.join('\n');
-
     // --- write outputs: one OUTDR store per touched GPIO port ---
     // Non-output pins are configured as floating inputs (output driver off),
     // so writing their OUTDR latch bit is harmless -- the pin isn't driven.
@@ -195,9 +223,9 @@ const generateMainC = (ports, evalBody, topModule, portConfig) => {
         const terms = [];
         for (const { port, bitIndex, pin } of outPinsByPort[gp]) {
             const v = `(${portVar(port.name)} >> ${bitIndex}U) & 1U`;
-            terms.push(`        | ((uint32_t)(${v}) << ${pin.bit}U)`);
+            terms.push(`            | ((uint32_t)(${v}) << ${pin.bit}U)`);
         }
-        writeLines.push(`    ${gpioPtr(gp)}->OUTDR = 0\n${terms.join('\n')}\n        ;`);
+        writeLines.push(`        ${gpioPtr(gp)}->OUTDR = 0\n${terms.join('\n')}\n            ;`);
     }
     const writeOutputs = writeLines.join('\n') || '    /* no driven output bits */';
 
@@ -227,9 +255,11 @@ ${pinComment}
 
 ${portDecls}
 
+${declarePreviousInputs(inputs, userCfg)}
+
 // Verilator-lowered logic (translated from
 // V${topModule}___024root___ico_sequent__TOP__0).
-static void eval(void) {
+static inline void eval(void) {
 ${body}
 }
 
@@ -238,20 +268,16 @@ static void io_init(void) {
 ${initPins}
 }
 
-static void sim_step(void) {
-    // read inputs
-${readInputs}
-    // evaluate logic
-    eval();
-    // write outputs
-${writeOutputs}
-}
-
 int main(void) {
     ${A.systemInit}();
     io_init();
     while (1/*loop*/) {
-        sim_step();
+        // read inputs
+${readInputs(inputs, userCfg)}
+        // evaluate logic
+        eval();
+        // write outputs
+${writeOutputs}
     }
 }
 `;
@@ -301,6 +327,7 @@ TARGET:=main
 
 TARGET_MCU?=CH32V003
 CH32FUN?=${ch32funPath}
+EXTRA_CFLAGS?=-O3
 include $(CH32FUN)/ch32fun.mk
 
 create:
@@ -315,72 +342,67 @@ clean : cv_clean
 };
 
 // --- .lst parsing + timing analysis ----------------------------------------
-// The discovered model: T = c/f + m, where
-//   c = loop instruction count (CPU cycles, ~1 cycle/instr on rv32ec),
-//   f = core clock (Hz),
-//   m = mmio_count * 0.1 us  (AHB->APB bridge floor, ~0.1 us per MMIO access;
-//       empirically 2 MMIO -> 0.2 us, so 0.1 us each).
-// Tmean = 1.5*T, Tjitter = 0.5*T (sampling-jitter model).
-
-// The .lst is objdump -S output, so source lines are interleaved with
-// disassembly. With -flto, sim_step/eval/io_init inline into main, so some
-// source comments disappear, but the actual source statements survive. We
-// anchor on:
-//   "GPIO*->INDR"      -> first instruction of the loop (the INDR load)
-//   "while (1/*loop*/" -> the back-edge j/jal just below it
-// The /*loop*/ marker is injected by the generator to survive inlining.
-const analyzeLst = (lstText) => {
+// IC-timing-style model with a fast/slow dual path.
+//
+// Change-detection gives the loop two execution paths:
+//   * fast path  -- no input changed: read each input port's INDR, compare to
+//     its saved previous value, `continue`. Skips eval + OUTDR writes.
+//   * slow path  -- some input changed: read INDRs, detect change, run eval,
+//     write OUTDRs, loop back. Counted from the full loop body in main.lst.
+//
+// While inputs are idle every iteration runs the fast path, so the loop polls
+// at 1/Tfast. An edge arriving at a random phase waits uniform[0, Tfast] for
+// the next INDR read (mean Tfast/2), then the detecting slow-path iteration
+// spends its read->write span Tslow to drive OUTDR. Analogous to a clocked FF
+// + combinational logic:
+//   Tdelay  = Tslow + Tfast/2     (mean input->output delay)
+//   Tjitter = +-Tfast/2           (aperture jitter -- the only variable term)
+// With change-detection off, Tfast = Tslow = T -> Tdelay = 1.5T, Tjitter =
+// +-0.5T (the oscilloscope-validated single-path model).
+//
+// Per-path costs (calibrated against oscilloscope):
+//   Tfast = instrs_fast / f + mmio_fast * 0.05us
+//     The idle poll's one branch is always taken the same way (no mispredict
+//     bubble, no +1.6); it only does INDR reads (~0.05us each). Pinned by the
+//     74x04 jitter: 3 input ports -> Tfast = 0.36us @ 48 MHz (Tjitter = +-0.18us).
+//   Tslow = (instrs_slow + 1.6) / f + mmio_slow * 0.1us
+//     +1.6 taken-back-edge bubble; OUTDR writes pay the full AHB->APB bridge
+//     floor (0.1us). Pinned by 8 instrs + 1.6 = 9.6 cyc = 0.4us @ 48 MHz,
+//     0.6us @ 24 MHz.
+//
+// The fast path is estimated from numInPorts (stable, known at generation
+// time) as 3*P+1 instrs + P INDR reads, rather than parsed out of the heavily
+// rotated/interleaved disassembly. The .lst is objdump -S output; with -flto
+// sim_step/eval/io_init inline into main, so we anchor the loop on the first
+// "->INDR" annotation, recover the full body extent from the lowest back-edge
+// target, and count instructions + MMIO over that range.
+const analyzeLst = (lstText, numInPorts, checkForChanges) => {
     const lines = lstText.split('\n');
-    // Find the "->INDR" source-annotation line; the first disassembly line
-    // at or after it is the loop entry (the INDR load).
-    let loopStartIdx = -1;
-    for (let i = 0; i < lines.length; i++) {
-        if (/->\s*INDR/.test(lines[i]) && !/^\s+[0-9a-f]+:/.test(lines[i])) {
-            for (let j = i + 1; j < lines.length; j++) {
-                if (/^\s+[0-9a-f]+:\s+/.test(lines[j])) {
-                    loopStartIdx = j;
-                    break;
+    const disasmRe = /^\s+([0-9a-f]+):\s+/;
+    const addrOf = (i) => parseInt(lines[i].match(disasmRe)[1], 16);
+    const isDisasm = (i) => i >= 0 && i < lines.length && disasmRe.test(lines[i]);
+
+    // First disassembly line at or after a source annotation line.
+    const firstDisasmAfter = (annoRe) => {
+        for (let i = 0; i < lines.length; i++) {
+            if (annoRe.test(lines[i]) && !disasmRe.test(lines[i])) {
+                for (let j = i + 1; j < lines.length; j++) {
+                    if (disasmRe.test(lines[j])) return j;
                 }
             }
-            break;
         }
-    }
-    // Find the "while (1/*loop*/" annotation; the last disassembly line
-    // before it is the back-edge (the `j` instruction).
-    let loopEndIdx = -1;
-    for (let i = loopStartIdx >= 0 ? loopStartIdx : 0; i < lines.length; i++) {
-        if (/while\s*\(\s*1\s*\/\*loop\*\//.test(lines[i])) {
-            for (let j = i - 1; j >= loopStartIdx; j--) {
-                if (/^\s+[0-9a-f]+:\s+/.test(lines[j])) {
-                    loopEndIdx = j;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    if (loopStartIdx < 0 || loopEndIdx < 0) return null;
+        return -1;
+    };
 
-    // Collect loop body disassembly lines.
-    const loopLines = [];
-    for (let i = loopStartIdx; i <= loopEndIdx; i++) {
-        if (/^\s+[0-9a-f]+:\s+/.test(lines[i])) loopLines.push(lines[i]);
-    }
-    if (!loopLines.length) return null;
-    const instructions = loopLines.length;
-
-    // Identify MMIO accesses: lw/sw with offset 8 (INDR) or 12 (OUTDR) on a
-    // register that holds a GPIO base address. Track GPIO registers across
-    // the whole function (they're set up before the loop).
-    // GPIO base addresses: A=0x40010800, B=0x40010C00, C=0x40011000, D=0x40011400.
+    // GPIO base registers (A=0x40010800, B=..C00, C=..1000, D=..1400) are set
+    // up before the loop; track them across the whole function so MMIO counts
+    // can resolve lw/sw bases, including addi-derived pointers (e.g. GPIOD from
+    // GPIOC -- all share the upper 16 bits 0x4001).
     const gpioRegs = new Set();
     for (const l of lines) {
         const m = l.match(/^\s+[0-9a-f]+:\s+[0-9a-f]+\s+lui\s+(\w+),0x4001[0-9a-f]/i);
         if (m) gpioRegs.add(m[1]);
     }
-    // addi reg, gpreg, offset -> derived GPIO pointer (e.g. GPIOD from GPIOC)
-    // GPIO ports are at 0x40010800, 0x40010C00, 0x40011000, 0x40011400 --
-    // all share the upper 16 bits 0x4001. Check against that range.
     for (const l of lines) {
         const m = l.match(/^\s+[0-9a-f]+:\s+[0-9a-f]+\s+addi\s+(\w+),(\w+),/i);
         if (m && gpioRegs.has(m[2])) {
@@ -393,36 +415,104 @@ const analyzeLst = (lstText) => {
             }
         }
     }
-
-    let mmio = 0;
-    for (const l of loopLines) {
+    // MMIO access: lw/sw with offset 8 (INDR read) or 12 (OUTDR write) on a
+    // register holding a GPIO base address.
+    const isMmio = (l) => {
         const m = l.match(/^\s+[0-9a-f]+:\s+\S+\s+(lw|sw)\s+\w+,\s*(\d+)\((\w+)\)/i);
-        if (m && gpioRegs.has(m[3]) && (parseInt(m[2]) === 8 || parseInt(m[2]) === 12)) {
-            mmio++;
+        return m && gpioRegs.has(m[3]) && (parseInt(m[2]) === 8 || parseInt(m[2]) === 12);
+    };
+    const countRange = (a, b) => {
+        let instructions = 0, mmio = 0;
+        for (let i = a; i <= b; i++) {
+            if (!disasmRe.test(lines[i])) continue;
+            instructions++;
+            if (isMmio(lines[i])) mmio++;
+        }
+        return { instructions, mmio };
+    };
+
+    // Loop body anchor: the first `->INDR` source annotation (may land mid-loop
+    // due to load rotation; the true extent is recovered below).
+    let loopStartIdx = firstDisasmAfter(/->\s*INDR/);
+    if (loopStartIdx < 0) return null;
+
+    // Back-edges: every backward unconditional jump (j/jal) at or after the
+    // loop start. Stop at the next function label so an IRQ handler's
+    // `1: j 1b` isn't mistaken for a loop back-edge. With change-detection the
+    // compiler may emit two back-edges (fast-path into the prologue, slow-path
+    // into eval); the full body spans the lowest target to the last back-edge.
+    const jumpRe = /^\s+([0-9a-f]+):\s+\S+\s+(j|jal)\s+([0-9a-f]+)\b/i;
+    const funcLabelRe = /^[0-9a-f]+\s+<.*>:/;
+    const backEdges = [];
+    for (let i = loopStartIdx; i < lines.length; i++) {
+        if (funcLabelRe.test(lines[i]) && i > loopStartIdx) break;
+        if (!disasmRe.test(lines[i])) continue;
+        const m = lines[i].match(jumpRe);
+        if (!m) continue;
+        const target = parseInt(m[3], 16);
+        if (target > addrOf(i)) continue;
+        for (let k = i; k >= 0; k--) {
+            if (isDisasm(k) && addrOf(k) === target) {
+                backEdges.push({ idx: i, targetIdx: k });
+                break;
+            }
         }
     }
-    return { instructions, mmio };
+    if (!backEdges.length) return null;
+
+    // Loop top = lowest back-edge target; extend the body start down to it so
+    // the whole loop (including any rotated prologue tail) is covered.
+    const loopTopIdx = backEdges.reduce((lo, be) =>
+        (be.targetIdx < lo ? be.targetIdx : lo), backEdges[0].targetIdx);
+    if (addrOf(loopTopIdx) < addrOf(loopStartIdx)) loopStartIdx = loopTopIdx;
+    const backEdgeIdx = backEdges[backEdges.length - 1].idx;
+
+    // Slow path = the full loop body (INDR reads + eval + OUTDR writes).
+    const slow = countRange(loopStartIdx, backEdgeIdx);
+    if (!slow.instructions) return null;
+
+    // Fast path: estimated from the input GPIO port count -- 3 instrs/port
+    // (INDR load + compare + prev-save) + 1 loop-tail shuffle, 1 INDR/port.
+    // With change-detection off the loop is a single path, so fast == slow.
+    if (checkForChanges && numInPorts > 0) {
+        return { fast: { instructions: 3 * numInPorts + 1, mmio: numInPorts },
+                 slow, dual: true };
+    }
+    return { fast: slow, slow, dual: false };
 };
 
 const reportTiming = (analysis, clock) => {
-    const { instructions, mmio } = analysis;
     const f = clock.mhz * 1e6;          // Hz
-    // c = instruction count + ~1.6 cycles branch/pipeline overhead per iter.
-    // Calibrated against oscilloscope: 8 instrs + 1.6 = 9.6 cycles matches
-    // 0.4 us @ 48 MHz and 0.6 us @ 24 MHz with m = 0.2 us (2 MMIO).
-    const c = instructions + 1.6;       // CPU cycles
-    const m = mmio * 0.1e-6;            // 0.1 us per MMIO (AHB->APB bridge)
-    const T = c / f + m;                // loop period (s)
-    const Tmean = 1.5 * T;
-    const Tjitter = 0.5 * T;
+    // Slow path: +1.6 taken-back-edge bubble, 0.1 us/MMIO (OUTDR, AHB->APB).
+    const periodSlow = (instrs, mmio) => (instrs + 1.6) / f + mmio * 0.1e-6;
+    // Fast path: no branch bubble (idle poll always takes the same way),
+    // 0.05 us/MMIO (INDR read, cheaper than OUTDR write).
+    const periodFast = (instrs, mmio) => instrs / f + mmio * 0.05e-6;
+    const Tfast = analysis.dual
+        ? periodFast(analysis.fast.instructions, analysis.fast.mmio)
+        : periodSlow(analysis.fast.instructions, analysis.fast.mmio);
+    const Tslow = periodSlow(analysis.slow.instructions, analysis.slow.mmio);
+    // See the model comment above analyzeLst for the Tdelay/Tjitter derivation.
+    const Tdelay  = Tslow + Tfast / 2;
+    const Tjitter = Tfast / 2;
+    const us = (sec) => (sec * 1e6).toFixed(2);
     console.log('');
     console.log('Timing analysis');
     console.log('----------------');
     console.log(`  clock:        ${clock.mhz} MHz${clock.use_pll === false ? ' (HSI, no PLL)' : ' (PLL)'}`);
-    console.log(`  loop:         ${instructions} instructions + ~1.6 br overhead = ${c.toFixed(1)} cycles, ${mmio} MMIO accesses`);
-    console.log(`  T (loop):     ${(T * 1e6).toFixed(2)} us`);
-    console.log(`  Tmean:        ${(Tmean * 1e6).toFixed(2)} us`);
-    console.log(`  Tjitter:      +-${(Tjitter * 1e6).toFixed(2)} us`);
+    if (analysis.dual) {
+        const sC = analysis.slow.instructions + 1.6;
+        console.log(`  fast path:    ${analysis.fast.instructions} instrs, ${analysis.fast.mmio} INDR reads  -> Tfast = ${us(Tfast)} us`);
+        console.log(`  slow path:    ${analysis.slow.instructions} instrs +1.6 = ${sC.toFixed(1)} cyc, ${analysis.slow.mmio} MMIO  -> Tslow = ${us(Tslow)} us`);
+        console.log(`  Tdelay:       ${us(Tdelay)} us   (Tslow + Tfast/2)`);
+        console.log(`  Tjitter:      +-${us(Tjitter)} us   (Tfast/2 aperture)`);
+    } else {
+        const c = analysis.fast.instructions + 1.6;
+        console.log(`  loop:         ${analysis.fast.instructions} instrs +1.6 = ${c.toFixed(1)} cyc, ${analysis.fast.mmio} MMIO accesses`);
+        console.log(`  T (loop):     ${us(Tfast)} us`);
+        console.log(`  Tdelay:       ${us(Tdelay)} us   (1.5*T)`);
+        console.log(`  Tjitter:      +-${us(Tjitter)} us   (T/2 aperture)`);
+    }
 };
 
 const main = async () => {
@@ -486,7 +576,7 @@ const main = async () => {
     // 4) Emit main.c, funconfig.h, Makefile.
     let mainC;
     try {
-        mainC = generateMainC(ports, evalBody, topModule, cfg.ports);
+        mainC = generateMainC(ports, evalBody, topModule, cfg);
     } catch (e) {
         console.error(`Cannot generate main.c: ${e.message}`);
         process.exit(1);
@@ -511,7 +601,18 @@ const main = async () => {
 
     // 6) Parse the .lst disassembly and run timing analysis.
     const lstText = await fs.promises.readFile('main.lst', 'utf8');
-    const analysis = analyzeLst(lstText);
+    // Number of distinct GPIO ports that carry inputs -- drives the fast-path
+    // estimate (one INDR read + compare per port). Pins were resolved during
+    // generation; recompute the port set from the config + pin specifiers.
+    const checkForChanges = !cfg.doNotCheckForChanges;
+    const inPorts = new Set();
+    for (const p of ports) {
+        if (p.direction !== 'INPUT') continue;
+        const pc = cfg.ports[p.name];
+        if (pc) pc.pins.forEach(s => inPorts.add(parsePin(s).gpioPort));
+    }
+    const numInPorts = inPorts.size;
+    const analysis = analyzeLst(lstText, numInPorts, checkForChanges);
     if (!analysis) {
         console.error('Could not find the hot loop in main.lst; skipping timing analysis.');
         process.exit(0);

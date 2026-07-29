@@ -93,48 +93,63 @@ running `cli.js`) a generated `main.c` + `funconfig.h` + `Makefile`.
 ## Benchmark: 74x04 inverter
 
 Oscillogram of one gate of the 74x04 inverter. Blue line is the input, yellow
-line is the output. Loop period T = 0.4 µs; mean input→output delay ≈ 1.5T =
-0.6 µs; jitter ≈ ±0.5T = ±0.2 µs.
+line is the output. With change-detection the loop polls at the fast-path rate
+while inputs are idle and runs the slow path only on the iteration that detects
+an edge; the input→output delay is `Tslow + Tfast/2` with `±Tfast/2` aperture
+jitter (see below).
 
 ![](assets/inverter-waveform.jpg)
 
 ### Timing model
 
-The polling loop reads `INDR` at the start of each iteration and writes
-`OUTDR` at the end, so the read→write span `d ≈ T`. For an input edge arriving
-at a random phase relative to the loop:
+The loop has two execution paths because of change-detection:
+
+- **fast path** -- no input changed: read each input GPIO port's `INDR`,
+  compare against the saved previous value, `continue` back to the top. Skips
+  eval + `OUTDR` writes. Cost is one `INDR` read + compare per input port, so
+  it is estimated from the number of input GPIO ports (P):
+  `Tfast ≈ (3·P + 1)/f + P·0.05 µs`. The idle poll loop's one branch is always
+  taken the same way (no mispredict bubble, no +1.6), and it only does `INDR`
+  reads, which are cheaper than `OUTDR` writes (~0.05 µs each).
+- **slow path** -- some input changed: read `INDR`, detect the change, run
+  `eval`, write `OUTDR`, loop back. `Tslow = (instrs + 1.6)/f + mmio·0.1 µs` is
+  counted from the full loop body in `main.lst` (the +1.6 is the taken
+  back-edge bubble; OUTDR writes pay the full AHB→APB bridge floor).
+
+While inputs are idle, *every* iteration runs the fast path, so the loop polls
+at `1/Tfast`. An input edge arriving at a random phase waits for the next
+`INDR` read (uniform in `[0, Tfast]`, mean `Tfast/2`), then the detecting
+slow-path iteration spends its read→write span `Tslow` to drive `OUTDR`. This
+is exactly a clocked-FF + combinational-logic timing model:
 
 ```
-Tfast  = d              ≈ T      (edge just before INDR read)
-Tslow  = T + d          ≈ 2T     (edge just after INDR read)
-Tmean  = (Tfast+Tslow)/2 = 1.5T
-Tjitter = (Tslow-Tfast)/2 = 0.5T
+Tdelay  = Tslow + Tfast/2     (mean input→output delay)
+Tjitter = ±Tfast/2            (aperture jitter — the only variable term)
 ```
 
-The jitter is entirely **sampling (aperture) jitter** -- not interrupt
-latency -- and equals `T/2` regardless of where the write sits in the loop.
-The only lever on jitter is shortening T.
+The jitter is entirely **sampling (aperture) jitter** -- not interrupt latency
+-- and the only lever on it is shortening the fast path (the poll rate). With
+change-detection off, `Tfast = Tslow = T` and this reduces to the
+oscilloscope-validated `Tdelay = 1.5T`, `Tjitter = ±0.5T`.
 
 ### Where the time goes
 
-```
-T = c/f + m
-```
+Two oscilloscope data points pin the slow-path model (`Tslow = (instrs+1.6)/f +
+mmio·0.1 µs`):
 
-- `c` = CPU cycles (loop instructions + ~1.6 branch overhead)
-- `f` = core clock
-- `m` = MMIO bridge time (AHB→APB), ~0.1 µs per GPIO access, clock-independent
-
-Two oscilloscope data points pin the model exactly:
-
-| clock | T (measured) | T (model) |
-|-------|-------------|-----------|
+| clock | Tslow (measured) | Tslow (model) |
+|-------|------------------|---------------|
 | 48 MHz (PLL) | 0.4 µs | 0.40 µs |
 | 24 MHz (HSI) | 0.6 µs | 0.60 µs |
 
-Solving: `c = 9.6` cycles, `m = 0.2 µs` (2 MMIO). At 48 MHz the loop is
-**50% CPU-bound, 50% MMIO-bound** -- the clock is only a half-lever because
-the AHB→APB bridge sets a ~0.2 µs floor the PLL can't touch.
+Solving: `c = 9.6` cycles, `m = 0.2 µs` (2 MMIO). The fast path
+(`Tfast = instrs/f + mmio·0.05 µs`, no branch bubble, cheaper INDR reads) is
+pinned by the 74x04 jitter measurement: 3 input ports → `Tfast = 0.36 µs` →
+`Tjitter = ±0.18 µs`. At 48 MHz the slow path is **50% CPU-bound, 50%
+MMIO-bound** -- the clock is only a half-lever because the AHB→APB bridge sets
+a floor the PLL can't touch; the fast path (and thus the jitter) is dominated
+by the `INDR` read cost, so the clock is only a weak lever on jitter -- the
+real lever is reading fewer input ports.
 
 For low-density logic the gate eval itself (`~a`, `~(a & b)`, etc.) is a
 handful of ALU instructions and is **not** the bottleneck. The dominant cost
@@ -150,11 +165,12 @@ span multiple GPIO ports cost ~3×.
 Timing analysis
 ----------------
   clock:        48 MHz (PLL)
-  loop:         8 instructions + ~1.6 br overhead = 9.6 cycles, 2 MMIO accesses
-  T (loop):     0.40 us
-  Tmean:        0.60 us
-  Tjitter:      +-0.20 us
+  fast path:    10 instrs, 3 INDR reads  -> Tfast = 0.36 us
+  slow path:    58 instrs +1.6 = 59.6 cyc, 7 MMIO  -> Tslow = 1.94 us
+  Tdelay:       2.12 us   (Tslow + Tfast/2)
+  Tjitter:      +-0.18 us   (Tfast/2 aperture)
 ```
+
 ### openSUSE Tumbleweed
 
 ```
