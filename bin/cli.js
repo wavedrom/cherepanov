@@ -53,7 +53,11 @@ const extractEvalBody = async (objDir, topModule) => {
     for (const f of candidates) {
         const src = await fs.promises.readFile(path.join(objDir, f), 'utf8');
         const m = src.match(re);
-        if (m) return translateBody(m[1]);
+        if (m) {
+            const body = translateBody(m[1]);
+            const constPools = await extractConstPools(objDir, topModule, body);
+            return { body, constPools };
+        }
     }
     throw new Error(`Could not find eval body ${fname} in ${objDir}`);
 };
@@ -77,6 +81,52 @@ const translateBody = (body) => {
         .replace(/__DOT__/g, '_')             // internal signal names
         .replace(/VL_UNLIKELY\(([^)]*)\)/g, '($1)');
     return out.trim();
+};
+
+// --- Constant-pool extraction ----------------------------------------------
+// Verilator lowers `case` statements (and other wide muxes) into table lookups
+// and emits the table data in a SEPARATE file V<top>__ConstPool_<n>.cpp, e.g.:
+//   extern const VlUnpacked<CData/*6:0*/, 128> Vtop__ConstPool__TABLE_xxx_0 = {{
+//       0x7fU, 0x00U, ...
+//   }};
+// The eval body only references the symbol; the definition is NOT in the
+// DepSet cpp. Without copying it, main.c references an undefined symbol and
+// fails to link. We scan the (translated) body for __ConstPool__TABLE refs,
+// parse each ConstPool cpp, and transcribe every referenced table to a plain-C
+// `static const` array so the lowered body links standalone (no VlUnpacked,
+// no verilated runtime).
+const CONST_POOL_CTYPE = { CData: 'uint8_t', SData: 'uint16_t', IData: 'uint32_t', QData: 'uint64_t' };
+
+const extractConstPools = async (objDir, topModule, body) => {
+    // Symbols referenced in the lowered body, e.g. Vtop__ConstPool__TABLE_h6c3f4e05_0.
+    const refRe = /\b(V\w+__ConstPool__TABLE_\w+)\b/g;
+    const refs = new Set();
+    let m;
+    while ((m = refRe.exec(body))) refs.add(m[1]);
+    if (!refs.size) return '';
+    // ConstPool data lives in V<top>__ConstPool_<n>.cpp (never the Slow split).
+    const poolFiles = (await fs.promises.readdir(objDir))
+        .filter(f => /__ConstPool_.*\.cpp$/.test(f) && !f.includes('Slow'));
+    const out = [];
+    for (const f of poolFiles) {
+        const src = await fs.promises.readFile(path.join(objDir, f), 'utf8');
+        for (const name of refs) {
+            // extern const VlUnpacked<CData/*W:H*/, N> NAME = {{ <init> }};
+            const re = new RegExp(
+                `extern\\s+const\\s+VlUnpacked<\\s*(CData|SData|IData|QData)` +
+                `\\/\\*[0-9:]+\\*\\/,\\s*(\\d+)\\s*>\\s+${name}\\s*=\\s*\\{\\{([\\s\\S]*?)\\}\\};`
+            );
+            const mm = src.match(re);
+            if (mm) {
+                const ctype = CONST_POOL_CTYPE[mm[1]];
+                const count = +mm[2];
+                const init = mm[3].trim();
+                // VlUnpacked uses double braces {{...}}; a plain C array uses one.
+                out.push(`static const ${ctype} ${name}[${count}] = { ${init} };`);
+            }
+        }
+    }
+    return out.join('\n');
 };
 
 // --- Port mapping ----------------------------------------------------------
@@ -171,7 +221,7 @@ const readInputs = (inputs, cfg) => {
     return readLines.join('\n');
 };
 
-const generateMainC = (ports, evalBody, topModule, userCfg) => {
+const generateMainC = (ports, evalBody, topModule, userCfg, constPools) => {
     const A = cfg.api;
     // Attach resolved pins to each port and validate against the package.
     const portsWithPins = ports.map(p => ({ ...p, pins: resolvePins(p, userCfg.ports) }));
@@ -256,7 +306,7 @@ ${pinComment}
 ${portDecls}
 
 ${declarePreviousInputs(inputs, userCfg)}
-
+${constPools ? '\n' + constPools + '\n' : ''}
 // Verilator-lowered logic (translated from
 // V${topModule}___024root___ico_sequent__TOP__0).
 static inline void eval(void) {
@@ -571,12 +621,12 @@ const main = async () => {
     }
 
     // 3) Extract + translate the lowered eval body to plain C.
-    const evalBody = await extractEvalBody(objDir, topModule);
+    const { body: evalBody, constPools } = await extractEvalBody(objDir, topModule);
 
     // 4) Emit main.c, funconfig.h, Makefile.
     let mainC;
     try {
-        mainC = generateMainC(ports, evalBody, topModule, cfg);
+        mainC = generateMainC(ports, evalBody, topModule, cfg, constPools);
     } catch (e) {
         console.error(`Cannot generate main.c: ${e.message}`);
         process.exit(1);
