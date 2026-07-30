@@ -9,15 +9,47 @@ emulate the circuit -- slower than a real PLD, but cheap and flexible.
 
 ## How it works
 
-```
- top.v / top.sv  ──►  Verilator (--cc)  ──►  lowered logic body  ──►  cli.js  ──►  main.c
-                         (C++ logic)          (transcribed to C)        (GPIO bridge)
-                                                                                  │
-                                                                                  ▼
-                                                                          riscv64-elf-gcc
-                                                                                  │
-                                                                                  ▼
-                                                                            main.bin  ──►  CH32V003
+```mermaid
+%% cherepanov pipeline: Verilog/SystemVerilog -> CH32V003 firmware + timing report.
+%% bin/cli.js <config.js> drives every node except the final flash/mcu.
+flowchart TD
+    %% --- inputs ---
+    SRC["top.v / top.sv<br/>(+ optional .vh)"]
+    CFG["config.js<br/>port to pin map, clock"]
+
+    %% --- Verilator lowering (step 1) ---
+    VLT["Verilator --cc<br/>--pins-uint8 --no-timing"]
+    HDR["V(top).h<br/>port declarations"]
+    CPP["obj_dir/*.cpp<br/>___ico_sequent__TOP__0"]
+
+    %% --- cli.js transcription + bridge (steps 2-4) ---
+    CLI["bin/cli.js<br/>parse ports, translate body"]
+    MAIN["main.c<br/>GPIO bridge + eval()"]
+    FUN["funconfig.h<br/>clock / PLL"]
+    MK["Makefile"]
+
+    %% --- build (step 5) ---
+    MAKE["make build<br/>riscv64-elf-gcc -O3"]
+    BIN["main.bin"]
+    LST["main.lst<br/>disassembly"]
+
+    %% --- timing analysis on the disassembly (step 6) ---
+    ANA["analyze main.lst<br/>count instrs + MMIO<br/>in the hot loop"]
+    REP["Tdelay / Tjitter<br/>fast/slow dual-path"]
+
+    %% --- flash to target ---
+    FLASH["make flash<br/>ch32fun bootloader"]
+    MCU["CH32V003<br/>bit-bangs GPIO"]
+
+    SRC --> VLT
+    VLT --> HDR --> CLI
+    VLT --> CPP --> CLI
+    CFG --> CLI
+    CLI --> MAIN --> MAKE
+    CLI --> FUN --> MAKE
+    CLI --> MK --> MAKE
+    MAKE --> BIN --> FLASH --> MCU
+    MAKE --> LST --> ANA --> REP
 ```
 
 `bin/cli.js <config.js>` is the only entry point. It:
