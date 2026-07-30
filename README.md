@@ -57,7 +57,10 @@ flowchart TD
 1. Runs Verilator `--cc` to lower the Verilog/SystemVerilog into C++.
 2. Extracts the lowered logic body (`___ico_sequent__TOP__0`).
 3. Translates that body to plain C (no verilated runtime -- it's hosted-only
-   and won't build for the bare-metal `rv32ec` target).
+   and won't build for the bare-metal `rv32ec` target). Designs with a `case`
+   statement are lowered to a constant-pool table lookup whose data lives in a
+   separate `V<top>__ConstPool_<n>.cpp`; those tables are transcribed to plain-C
+   `static const` arrays so the body links standalone.
 4. Wraps it in a GPIO bridge: reads input pins via `GPIOx->INDR`, evaluates,
    writes output pins via `GPIOx->OUTDR`.
 5. Generates `funconfig.h` and `Makefile`, builds the firmware, and runs a
@@ -114,9 +117,15 @@ not driven externally.
 | `7400` | quad 2-input NAND | `top.v` | 852 B |
 | `74x02` | quad 2-input NOR | `top.v` | 828 B |
 | `74x04` | hex inverter (6 gates) | `top.sv` | 748 B |
+| `74x47` | BCD-to-7-segment decoder | `ic_74x47.v` | ~1100 B |
+
+`74x47` is the first example exercising a `case` statement: Verilator
+lowers it to a constant-pool table lookup, which `cli.js` transcribes to a
+`static const` array in `main.c` (see step 3 above).
 
 Each example directory has a `config.js`, a Verilog source, and (after
-running `cli.js`) a generated `main.c` + `funconfig.h` + `Makefile`.
+running `cli.js`) a generated `main.c` + `funconfig.h` + `Makefile`. Flash
+sizes are indicative -- they vary with the ch32fun/toolchain version.
 
 ## CH32V003 pinout
 
