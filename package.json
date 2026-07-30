@@ -1,6 +1,6 @@
 {
   "name": "cherepanov",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Use a CH32V003 microcontroller as a low-density Programmable Logic Device. Write logic in Verilog/SystemVerilog, get runtime-free C firmware for bare-metal GPIO bit-banging.",
   "homepage": "https://github.com/wavedrom/cherepanov#readme",
   "bugs": {
